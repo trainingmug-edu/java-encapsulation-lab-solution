@@ -1,0 +1,109 @@
+on:
+  workflow_dispatch:
+    inputs:
+      test_files:
+        description: 'Comma separated list of test files to download'
+        required: true
+      test_files_storage_location:
+        description: 'Location to store the test files'
+        required: true
+      webhook_token:
+        description: 'Token to authenticate the webhook'
+        required: true
+      callback_url:
+        description: 'URL to send the results to'
+        required: true
+
+jobs:
+  evaluate:
+    name: Evaluate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up JDK 18
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'adopt'
+          java-version: '18'
+      - name: Install yq
+        run: sudo snap install yq
+      - name: Download the additional test files
+        env:
+          TEST_FILES: ${{ inputs.test_files }}
+          TEST_FILES_STORAGE_LOCATION: ${{ inputs.test_files_storage_location }}
+        run: |
+          # Split the files by comma
+          file_list=${TEST_FILES//,/ }
+
+          # Download the files
+          for file in $file_list; do
+            fn="${file##*/}"
+            file_name="${fn%\?*}" # Get the file name
+            echo "Downloading $file_name in $TEST_FILES_STORAGE_LOCATION"
+            curl --create-dirs --output-dir $TEST_FILES_STORAGE_LOCATION -o $file_name $file
+          done
+      - name: Run the tests
+        run: mvn test
+        continue-on-error: true
+      - name: Parse and send the results to the API
+        env:
+          WEBHOOK_TOKEN: ${{ inputs.webhook_token }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          # Initialize global counters
+          total_tests=0
+          passed_tests=0
+          failed_tests=0
+
+          failures=()
+
+          # Loop through all XML files in the directory
+          for file in target/surefire-reports/*.xml; do
+            if [ -f "$file" ]; then
+              # Extract the total number of tests, passed tests, and failed tests using yq
+              tests=`yq '.testsuite.+@tests' $file`
+              failed=$((`yq '.testsuite.+@failures' "$file"` + `yq '.testsuite.+@errors' "$file"`))
+              passed=$((tests - failed))
+
+              # Accumulate the results
+              total_tests=$((total_tests + tests))
+              passed_tests=$((passed_tests + passed))
+              failed_tests=$((failed_tests + failed))
+
+              # Iterate through testcases
+
+              # Extract each testcase that has a failure and output its failure message
+              readarray testcases < <(yq e -o=j -I=0 '.testsuite.testcase[] | select(has("failure"))' "$file")
+
+              for testcase in "${testcases[@]}"; do
+                name=`echo $testcase | yq -r '.+@name'`
+                failure_message=`echo $testcase | yq -r '.failure.+@message'`
+                expected=`echo $failure_message | grep -oP '(?<=expected: <).*?(?=> but was: <)'`
+                actual=`echo $failure_message | grep -oP '(?<=but was: <).*?(?=>)'`
+                json_failure="{\"name\": \"$name\", \"expected\": \"$expected\", \"actual\": \"$actual\"}"
+                failures+=("$json_failure")
+              done
+            fi
+          done
+
+          formatted_failures=$(printf '%s\n' "${failures[@]}" | sed '$!s/$/,/')
+          failures="[$formatted_failures]"
+
+          if [[ -z $failures ]]; then
+            failures="[]"
+          fi
+
+          # Print the results
+          echo "Total tests: $total_tests"
+          echo "Total passed: $passed_tests"
+          echo "Total failed: $failed_tests"
+          echo "Failures: $failures"
+
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: $WEBHOOK_TOKEN" \
+            -d "{\"passedTests\": $passed_tests, \"failedTests\": $failed_tests, \"totalTests\": $total_tests, \"failures\": $failures, \"commitSHA\": \"$GITHUB_SHA\"}" \
+            $CALLBACK_URL
